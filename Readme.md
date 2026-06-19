@@ -6,7 +6,7 @@ A fast utility for converting **Leela Chess Zero (Lc0) V6 training data** (`.gz`
 
 * 🚀 Converts one or more LC0 V6 training chunks into a single binpack file
 * 📊 Optional summary statistics
-* 🎯 Supports filtering to **classical** games only
+* 🎯 Supports **classical** games only
 * 🗜️ Reads compressed `.gz` training files directly
 
 ## Building
@@ -20,7 +20,7 @@ cargo build --release
 The resulting executable will be located at:
 
 ```text
-target/release/lc0_parser
+target/release/lc0v6-binpack-converter
 ```
 
 ## Usage
@@ -28,7 +28,7 @@ target/release/lc0_parser
 Convert one or more training files into a binpack:
 
 ```bash
-./lc0_parser --summary --classical-only -o <filename>.binpack <directory>/*.gz
+./lc0v6-binpack-converter --summary --classical-only -o <filename>.binpack <directory>/*.gz
 ```
 
 To process an entire directory of training chunks:
@@ -38,7 +38,7 @@ time find <directory> \
     -maxdepth 1 \
     -name "*.gz" \
     -print0 | \
-xargs -0 ./lc0_parser --summary --classical-only -o <filename>.binpack
+xargs -0 ./lc0v6-binpack-converter --summary --classical-only -o <filename>.binpack
 ```
 
 ## Why use `find` and `xargs`?
