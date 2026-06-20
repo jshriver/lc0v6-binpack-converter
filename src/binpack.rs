@@ -42,6 +42,21 @@
 //! ## Result
 //!   Derived from result_q (+1 win, 0 draw, -1 loss, side-to-move perspective).
 //!
+//! ## Ply / chaining
+//!
+//! `sfbinpack`'s `CompressedTrainingDataEntryWriter` keeps the last entry it
+//! wrote and only delta-compresses the next one (skipping the full FEN) when
+//! `TrainingDataEntry::is_continuation` holds:
+//!   - `ply` increases by exactly 1, AND
+//!   - applying the previous entry's move to its position produces exactly
+//!     the next entry's position, AND
+//!   - `result` flips sign between the two (this falls out automatically
+//!     since lc0's `result_q` is already side-to-move relative).
+//!
+//! The caller (see `main.rs::process_file`) is responsible for handing us a
+//! `ply` that increments by one per record within a game and starts over at
+//! each new file/game. We just thread it through to the entry unchanged.
+//!
 //! ## En passant
 //!
 //! Classical-format records encode en passant via phantom pawns in plane 6
@@ -328,7 +343,13 @@ fn check_legal_standard_chess(uci: &str, fen: &str) -> Result<(), BinpackError> 
 /// The FEN, move, and evaluation are all self-contained within one record.
 /// When Black is to move the move index is in flipped coordinates and must
 /// be mirrored vertically before being applied to the standard-orientation FEN.
-pub fn record_to_entry(rec: &V6Record) -> Result<TrainingDataEntry, BinpackError> {
+///
+/// `ply` is the caller-tracked position of this record within its game (see
+/// `main.rs::process_file`) — 0 for the first record of a .gz file/game,
+/// incrementing by 1 per record thereafter. It's required for the binpack
+/// writer's chain-compression to kick in between consecutive moves of the
+/// same game; see the module docs above for the exact continuation rule.
+pub fn record_to_entry(rec: &V6Record, ply: u16) -> Result<TrainingDataEntry, BinpackError> {
     // Build FEN — this correctly encodes the ep square for classical format
     // and drops geometrically inconsistent castling rights.
     let fen = record_to_fen(rec).map_err(BinpackError::Fen)?;
@@ -366,7 +387,7 @@ pub fn record_to_entry(rec: &V6Record) -> Result<TrainingDataEntry, BinpackError
         pos,
         mv,
         score:  best_q_to_score(rec),
-        ply:    0,
+        ply,
         result: result_q_to_result(rec.result_q),
     })
 }
@@ -394,13 +415,18 @@ impl BinpackWriter {
         Ok(Self { inner: Some(inner), written: 0, skipped: 0 })
     }
 
-    /// Write one record.
+    /// Write one record at the given game-relative `ply`.
+    ///
+    /// `ply` should be 0 for the first record of a game/file and increment by
+    /// 1 per record thereafter (see `main.rs::process_file`). This lets the
+    /// underlying `sfbinpack` writer delta-compress consecutive moves of the
+    /// same game instead of re-emitting a full FEN for every record.
     ///
     /// Returns `Ok(true)` on success, `Ok(false)` if the record was skipped
     /// due to a recoverable conversion error (bad FEN, illegal move, FRC
     /// position, etc.).  Fatal IO/writer errors are propagated.
-    pub fn write_record(&mut self, rec: &V6Record) -> Result<bool, BinpackError> {
-        match record_to_entry(rec) {
+    pub fn write_record(&mut self, rec: &V6Record, ply: u16) -> Result<bool, BinpackError> {
+        match record_to_entry(rec, ply) {
             Ok(entry) => {
                 self.inner
                     .as_mut()

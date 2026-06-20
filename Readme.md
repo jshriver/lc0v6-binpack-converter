@@ -28,7 +28,7 @@ target/release/lc0v6-binpack-converter
 Convert one or more training files into a binpack:
 
 ```bash
-./lc0v6-binpack-converter --summary --classical-only -o <filename>.binpack <directory>/*.gz
+./lc0v6-binpack-converter --summary -o <filename>.binpack <directory>/*.gz
 ```
 
 To process an entire directory of training chunks:
@@ -38,7 +38,7 @@ time find <directory> \
     -maxdepth 1 \
     -name "*.gz" \
     -print0 | \
-xargs -0 ./lc0v6-binpack-converter --summary --classical-only -o <filename>.binpack
+xargs -0 ./lc0v6-binpack-converter --summary -o <filename>.binpack
 ```
 
 ## Why use `find` and `xargs`?
@@ -63,6 +63,14 @@ Produces:
 
 * `<filename>.binpack` — the generated binpack file
 * Summary statistics (when `--summary` is enabled)
+
+## Acknowledgements
+
+* The Stockfish and LC0 team for their hard work over and the wonderful engines that resulted.
+* The people who donate their computing time for the Lc0 training network and the Stockfish fishtest system.
+* Disservin for the very useful sfbinpack crate
+* Jamie Whiting for his bullet training system.
+
 
 ## License
 

@@ -222,6 +222,22 @@ fn process_file(
     let mut buf          = vec![0u8; RECORD_SIZE];
     let mut file_skipped_err = 0usize;
 
+    // Per-game ply counter for binpack chaining. Each .gz file is one full
+    // game, so this resets to 0 at the top of every process_file() call.
+    // ply=0 marks the start of a new chain (the binpack writer always emits
+    // a full FEN anchor for it); each subsequent record gets ply+1, which
+    // lets the writer's is_continuation() check delta-compress the move
+    // instead of re-emitting the whole position.
+    //
+    // It's incremented for every record encountered in the file -- written
+    // or not. That keeps it aligned with the real move number in the game,
+    // so if a record is dropped (parse failure, classical-only filter, FRC
+    // detected mid-write, etc.) the next *written* record's ply will no
+    // longer be exactly +1 from the last *written* one. Combined with the
+    // resulting position no longer matching, the writer correctly starts a
+    // fresh anchor rather than silently chaining onto a gap.
+    let mut ply: u16 = 0;
+
     let filename = path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("?");
@@ -256,6 +272,7 @@ fn process_file(
             None    => {
                 eprintln!("\n  ⚠️  Could not parse record #{}", *global_index);
                 *global_index += 1;
+                ply = ply.saturating_add(1);
                 continue;
             }
         };
@@ -264,11 +281,16 @@ fn process_file(
         if args.classical_only && rec.input_format != INPUT_CLASSICAL {
             stats.skipped_frc += 1;
             *global_index += 1;
+            ply = ply.saturating_add(1);
             continue;
         }
 
         let rec_idx = *global_index;
         *global_index += 1;
+
+        // Capture this record's ply before bumping the counter for the next one.
+        let rec_ply = ply;
+        ply = ply.saturating_add(1);
 
         if rec_idx < args.skip { continue; }
 
@@ -283,7 +305,7 @@ fn process_file(
         }
 
         if let Some(w) = writer.as_mut() {
-            match w.write_record(&rec) {
+            match w.write_record(&rec, rec_ply) {
                 Ok(_)  => {}
                 Err(e) => {
                     if args.verbosity.is_some() {
