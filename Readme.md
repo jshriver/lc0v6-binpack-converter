@@ -66,7 +66,7 @@ Produces:
 
 ## Acknowledgements
 
-* The Stockfish and LC0 team for their hard work over and the wonderful engines that resulted.
+* The Stockfish and LC0 team for their hard work over the years and the wonderful engines that resulted.
 * The people who donate their computing time for the Lc0 training network and the Stockfish fishtest system.
 * Disservin for the very useful sfbinpack crate
 * Jamie Whiting for his bullet training system.
