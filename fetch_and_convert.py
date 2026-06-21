@@ -227,6 +227,13 @@ for tarball in tarballs:
 
     # Download + extract (streamed, no tarball saved to disk)
     if not extract_path.exists():
+        # Check Content-Length to detect empty tarballs (10240 bytes) before downloading
+        head = requests.head(url, headers=HEADERS, timeout=30)
+        content_length = int(head.headers.get("Content-Length", -1))
+        if content_length == 10240:
+            print("⏭️  Tarball is empty (10240 bytes), skipping.")
+            continue
+
         cmd = f"set -o pipefail; wget -qO- {shlex.quote(url)} | tar -xf -"
         ret = run_with_spinner(["bash", "-c", cmd], f"Downloading {tarball}")
         if ret != 0:
@@ -255,7 +262,6 @@ for tarball in tarballs:
         ret = run([
             str(PARSER_BIN),
             "--summary",
-            "--classical-only",
             "-o", str(binpack_path),
             *batch,
         ])
