@@ -258,28 +258,30 @@ impl V6Record {
         s
     }
 }
-/// Convert a Q value in [-1.0, 1.0] to centipawns using the standard
-/// lc0↔Stockfish conversion formula:
-///   cp = 111.714640912 * tan(1.5620688421 * Q)
+
+// ── Q ↔ centipawn conversion ──────────────────────────────────────────────────
+
+/// Convert a Q value in [-1.0, 1.0] to centipawns using the lc0 formula:
+///   cp = 660.6 * q / (1.0 - 0.9751875 * q^10), clamped to [-32000, 32000]
 ///
-/// Returns None if Q is NaN, or exactly ±1.0 (which would be ±infinity cp).
-/// For proven mates (best_q_is_proven && best_q == 1.0) substitute a large
-/// fixed value like +30000 at the call site.
-pub fn q_to_cp(q: f32) -> Option<i32> {
-    if q.is_nan() || q <= -1.0 || q >= 1.0 {
+/// Returns None if Q is NaN.
+pub fn q_to_cp(q: f32) -> Option<i16> {
+    if q.is_nan() {
         return None;
     }
-    let cp = 111.714640912_f64 * (1.5620688421_f64 * q as f64).tan();
-    Some(cp.round() as i32)
+    let q = q as f64;
+    let cp = 660.6 * q / (1.0 - 0.9751875 * q.powi(10));
+    let cp = cp.clamp(-32000.0, 32000.0);
+    Some(cp.round() as i16)
 }
 
-/// Format a Q value as a centipawn string, e.g. "+42cp" or "mate" for ±1.0.
+/// Format a Q value as a centipawn string, e.g. "+42cp" or "±M" for proven mates.
 pub fn q_to_cp_str(q: f32, is_proven: bool) -> String {
     if q.is_nan() {
         return "N/A".to_string();
     }
-    if q >= 1.0  { return if is_proven { "+M".to_string() } else { "+30000cp".to_string() }; }
-    if q <= -1.0 { return if is_proven { "-M".to_string() } else { "-30000cp".to_string() }; }
+    if q >= 1.0  { return if is_proven { "+M".to_string() } else { "+32000cp".to_string() }; }
+    if q <= -1.0 { return if is_proven { "-M".to_string() } else { "-32000cp".to_string() }; }
     match q_to_cp(q) {
         Some(cp) => format!("{cp:+}cp"),
         None     => "N/A".to_string(),

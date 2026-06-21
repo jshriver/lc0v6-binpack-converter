@@ -40,13 +40,12 @@ const PROGRESS_INTERVAL: usize = 1000;
 // ── Args ──────────────────────────────────────────────────────────────────────
 
 struct Args {
-    files:          Vec<PathBuf>,
-    verbosity:      Option<Verbosity>,
-    limit:          Option<usize>,
-    skip:           usize,
-    summary:        bool,
-    classical_only: bool,
-    output:         Option<PathBuf>,
+    files:     Vec<PathBuf>,
+    verbosity: Option<Verbosity>,
+    limit:     Option<usize>,
+    skip:      usize,
+    summary:   bool,
+    output:    Option<PathBuf>,
 }
 
 fn usage(prog: &str) -> ! {
@@ -60,20 +59,20 @@ fn usage(prog: &str) -> ! {
            -l, --limit N          Only process the first N records\n\
            -s, --skip N           Skip the first N records\n\
            --summary              Print aggregate statistics at the end\n\
-           --classical-only       Skip FRC/variant records (input_format != 1)\n\
            -o, --output <file>    Export to .binpack file\n\
            -h, --help             Show this help\n\
          \n\
          Without -b/-n/-f, shows a live progress bar instead of per-record output.\n\
          Both raw binary and gzip-compressed (.gz) files are supported.\n\
+         Non-classical (FRC/variant) records are always skipped.\n\
          \n\
          EXAMPLES:\n\
            # Silent export with progress bar\n\
-           {prog} --classical-only -o out.binpack data/*.gz\n\
+           {prog} -o out.binpack data/*.gz\n\
            # Inspect first 10 records\n\
            {prog} --normal --limit 10 game.gz\n\
            # Inspect while exporting\n\
-           {prog} --brief --classical-only -o out.binpack game.gz"
+           {prog} --brief -o out.binpack game.gz"
     );
     process::exit(1);
 }
@@ -81,36 +80,34 @@ fn usage(prog: &str) -> ! {
 fn parse_args() -> Args {
     let raw: Vec<String> = env::args().collect();
     let prog = raw.first().map(String::as_str).unwrap_or("lc0_parser");
-    let mut files          = Vec::new();
-    let mut verbosity      = None;
-    let mut limit          = None;
-    let mut skip           = 0usize;
-    let mut summary        = false;
-    let mut classical_only = false;
-    let mut output         = None;
-    let mut i              = 1;
+    let mut files     = Vec::new();
+    let mut verbosity = None;
+    let mut limit     = None;
+    let mut skip      = 0usize;
+    let mut summary   = false;
+    let mut output    = None;
+    let mut i         = 1;
 
     while i < raw.len() {
         match raw[i].as_str() {
-            "-h" | "--help"        => usage(prog),
-            "-b" | "--brief"       => verbosity = Some(Verbosity::Brief),
-            "-n" | "--normal"      => verbosity = Some(Verbosity::Normal),
-            "-f" | "--full"        => verbosity = Some(Verbosity::Full),
-            "--summary"            => summary = true,
-            "--classical-only"     => classical_only = true,
-            "-l" | "--limit"       => {
+            "-h" | "--help"   => usage(prog),
+            "-b" | "--brief"  => verbosity = Some(Verbosity::Brief),
+            "-n" | "--normal" => verbosity = Some(Verbosity::Normal),
+            "-f" | "--full"   => verbosity = Some(Verbosity::Full),
+            "--summary"       => summary = true,
+            "-l" | "--limit"  => {
                 i += 1;
                 limit = Some(raw.get(i)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or_else(|| { eprintln!("--limit needs an integer"); process::exit(1); }));
             }
-            "-s" | "--skip"        => {
+            "-s" | "--skip"   => {
                 i += 1;
                 skip = raw.get(i)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or_else(|| { eprintln!("--skip needs an integer"); process::exit(1); });
             }
-            "-o" | "--output"      => {
+            "-o" | "--output" => {
                 i += 1;
                 output = Some(PathBuf::from(raw.get(i).unwrap_or_else(|| {
                     eprintln!("--output needs a filename"); process::exit(1);
@@ -130,7 +127,7 @@ fn parse_args() -> Args {
         usage(prog);
     }
 
-    Args { files, verbosity, limit, skip, summary, classical_only, output }
+    Args { files, verbosity, limit, skip, summary, output }
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -218,25 +215,10 @@ fn process_file(
     writer:       &mut Option<BinpackWriter>,
     prog:         &mut Option<Progress>,
 ) -> io::Result<()> {
-    let mut reader       = open_reader(path)?;
-    let mut buf          = vec![0u8; RECORD_SIZE];
+    let mut reader           = open_reader(path)?;
+    let mut buf              = vec![0u8; RECORD_SIZE];
     let mut file_skipped_err = 0usize;
-
-    // Per-game ply counter for binpack chaining. Each .gz file is one full
-    // game, so this resets to 0 at the top of every process_file() call.
-    // ply=0 marks the start of a new chain (the binpack writer always emits
-    // a full FEN anchor for it); each subsequent record gets ply+1, which
-    // lets the writer's is_continuation() check delta-compress the move
-    // instead of re-emitting the whole position.
-    //
-    // It's incremented for every record encountered in the file -- written
-    // or not. That keeps it aligned with the real move number in the game,
-    // so if a record is dropped (parse failure, classical-only filter, FRC
-    // detected mid-write, etc.) the next *written* record's ply will no
-    // longer be exactly +1 from the last *written* one. Combined with the
-    // resulting position no longer matching, the writer correctly starts a
-    // fresh anchor rather than silently chaining onto a gap.
-    let mut ply: u16 = 0;
+    let mut ply: u16         = 0;
 
     let filename = path.file_name()
         .and_then(|n| n.to_str())
@@ -277,8 +259,8 @@ fn process_file(
             }
         };
 
-        // Filter non-classical formats
-        if args.classical_only && rec.input_format != INPUT_CLASSICAL {
+        // Always skip non-classical (FRC/variant) records.
+        if rec.input_format != INPUT_CLASSICAL {
             stats.skipped_frc += 1;
             *global_index += 1;
             ply = ply.saturating_add(1);
@@ -288,7 +270,6 @@ fn process_file(
         let rec_idx = *global_index;
         *global_index += 1;
 
-        // Capture this record's ply before bumping the counter for the next one.
         let rec_ply = ply;
         ply = ply.saturating_add(1);
 
@@ -328,7 +309,7 @@ fn process_file(
         }
     }
 
-    // Final progress update for this file
+    // Final progress update for this file.
     if let Some(p) = prog.as_mut() {
         let (written, skipped_err) = writer.as_ref()
             .map(|w| (w.written(), w.skipped()))
@@ -345,7 +326,7 @@ fn main() {
     const _: () = assert!(RECORD_SIZE == 8356,
         "RECORD_SIZE must be 8356 — update offsets to match V6TrainingData");
 
-    let args         = parse_args();
+    let args             = parse_args();
     let mut global_index = 0usize;
     let mut shown        = 0usize;
     let mut stats        = Stats::default();

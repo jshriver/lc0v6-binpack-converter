@@ -37,7 +37,7 @@
 //! e.g. e2e4 (Black to move) -> e7e5 in standard coords.
 //!
 //! ## Score
-//!   best_q -> centipawns via q_to_cp().  Proven mates: ±30000 cp.
+//!   best_q -> centipawns via q_to_cp().  Proven mates: ±32000 cp.
 //!
 //! ## Result
 //!   Derived from result_q (+1 win, 0 draw, -1 loss, side-to-move perspective).
@@ -201,13 +201,6 @@ fn parse_uci_move(uci: &str, pos: &Position) -> Result<Move, BinpackError> {
     let moving_piece = pos.piece_at(from);
 
     // ── Castling ──────────────────────────────────────────────────────────────
-    // King moves more than one file: could be a standard castle or an FRC
-    // castle that slipped through the classical filter.
-    //
-    // We require the king to be on its classical starting square (e1/e8).
-    // If it isn't, this is an FRC position — skip the record.
-    // If it is, we check castling rights: present → standard castle encoded
-    // as king-captures-own-rook; absent → FRC position, skip.
     if moving_piece.piece_type() == PieceType::King {
         let file_diff = (to.index() & 7) as i32 - (from.index() & 7) as i32;
         if file_diff.abs() > 1 {
@@ -252,12 +245,6 @@ fn parse_uci_move(uci: &str, pos: &Position) -> Result<Move, BinpackError> {
     }
 
     // ── En passant ────────────────────────────────────────────────────────────
-    // A pawn moving diagonally to an empty square is en passant IFF the
-    // destination matches the position's ep square.  The ep square in `pos`
-    // comes from the FEN produced by `record_to_fen`, which correctly recovers
-    // the ep square from lc0's phantom-pawn encoding in plane 6 for classical
-    // format.  If there is no ep square the move is illegal — return an error
-    // so the record is skipped rather than written with a bad move type.
     if moving_piece.piece_type() == PieceType::Pawn {
         let from_file = (from.index() & 7) as i32;
         let to_file   = (to.index()   & 7) as i32;
@@ -281,14 +268,11 @@ fn parse_uci_move(uci: &str, pos: &Position) -> Result<Move, BinpackError> {
 // ── Score conversion ──────────────────────────────────────────────────────────
 
 /// Convert `best_q` to a centipawn score for the binpack entry.
-/// Saturates at ±30 000 cp (exact ±1.0 is only reachable for proven mates).
+///
+/// Uses `q_to_cp` which clamps to ±32 000 and returns `i16` directly.
+/// Exact ±1.0 (proven mates) saturate to ±32 000.
 fn best_q_to_score(rec: &V6Record) -> i16 {
-    let q = rec.best_q;
-    if q >=  1.0 { return  30_000; }
-    if q <= -1.0 { return -30_000; }
-    q_to_cp(q)
-        .map(|cp| cp.clamp(-30_000, 30_000) as i16)
-        .unwrap_or(0)
+    q_to_cp(rec.best_q).unwrap_or(0)
 }
 
 // ── Result conversion ─────────────────────────────────────────────────────────
@@ -350,8 +334,6 @@ fn check_legal_standard_chess(uci: &str, fen: &str) -> Result<(), BinpackError> 
 /// writer's chain-compression to kick in between consecutive moves of the
 /// same game; see the module docs above for the exact continuation rule.
 pub fn record_to_entry(rec: &V6Record, ply: u16) -> Result<TrainingDataEntry, BinpackError> {
-    // Build FEN — this correctly encodes the ep square for classical format
-    // and drops geometrically inconsistent castling rights.
     let fen = record_to_fen(rec).map_err(BinpackError::Fen)?;
     let pos = Position::from_fen(&fen)
         .map_err(|e| BinpackError::InvalidPosition(format!("{e:?} for FEN: {fen}")))?;
@@ -364,8 +346,6 @@ pub fn record_to_entry(rec: &V6Record, ply: u16) -> Result<TrainingDataEntry, Bi
         )));
     }
 
-    // lc0 policy indices are in the side-to-move frame (board flipped when
-    // Black to move).  Mirror squares back to standard coords for Black.
     let black_to_move = pos.side_to_move() == Color::Black;
     let uci = if black_to_move {
         mirror_uci_move(MOVE_STRS[best_idx])
@@ -376,9 +356,6 @@ pub fn record_to_entry(rec: &V6Record, ply: u16) -> Result<TrainingDataEntry, Bi
         MOVE_STRS[best_idx].to_string()
     };
 
-    // Validate legality in standard chess via shakmaty.  This is the primary
-    // FRC filter — it catches all FRC positions regardless of whether castling
-    // is involved or how far pieces have moved from their starting squares.
     check_legal_standard_chess(&uci, &fen)?;
 
     let mv = parse_uci_move(&uci, &pos)?;
@@ -417,11 +394,6 @@ impl BinpackWriter {
 
     /// Write one record at the given game-relative `ply`.
     ///
-    /// `ply` should be 0 for the first record of a game/file and increment by
-    /// 1 per record thereafter (see `main.rs::process_file`). This lets the
-    /// underlying `sfbinpack` writer delta-compress consecutive moves of the
-    /// same game instead of re-emitting a full FEN for every record.
-    ///
     /// Returns `Ok(true)` on success, `Ok(false)` if the record was skipped
     /// due to a recoverable conversion error (bad FEN, illegal move, FRC
     /// position, etc.).  Fatal IO/writer errors are propagated.
@@ -443,6 +415,7 @@ impl BinpackWriter {
             }
         }
     }
+
     /// Flush and finalise the binpack stream.  Safe to call multiple times.
     pub fn flush(&mut self) {
         if let Some(mut inner) = self.inner.take() {

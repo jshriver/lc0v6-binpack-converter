@@ -22,8 +22,7 @@ pub struct Progress {
     start:        Instant,
     processed:    usize,
     written:      usize,
-    skipped_frc:  usize,
-    skipped_err:  usize,
+    skipped:      usize,
     current_file: String,
 }
 
@@ -33,8 +32,7 @@ impl Progress {
             start:        Instant::now(),
             processed:    0,
             written:      0,
-            skipped_frc:  0,
-            skipped_err:  0,
+            skipped:      0,
             current_file: String::new(),
         }
     }
@@ -44,10 +42,9 @@ impl Progress {
     }
 
     pub fn update(&mut self, processed: usize, written: usize, skipped_frc: usize, skipped_err: usize) {
-        self.processed   = processed;
-        self.written     = written;
-        self.skipped_frc = skipped_frc;
-        self.skipped_err = skipped_err;
+        self.processed = processed;
+        self.written   = written;
+        self.skipped   = skipped_frc + skipped_err;
         self.render();
     }
 
@@ -58,7 +55,6 @@ impl Progress {
         let spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
         let frame = spinner[(elapsed * 10.0) as usize % spinner.len()];
 
-        // Truncate filename to keep the line from wrapping
         let file = if self.current_file.len() > 32 {
             &self.current_file[self.current_file.len() - 32..]
         } else {
@@ -66,8 +62,8 @@ impl Progress {
         };
 
         eprint!(
-            "\r{frame} {file:<32}  ✅ {:>8}  🚫 {:>5}  ⚠️  {:>4}  ⚡ {:.0}/s   ",
-            self.written, self.skipped_frc, self.skipped_err, rate,
+            "\r{frame} {file:<32}  ✅ {:>8}  🚫 {:>5}  ⚡ {:.0}/s   ",
+            self.written, self.skipped, rate,
         );
         let _ = io::stderr().flush();
     }
@@ -79,8 +75,7 @@ impl Progress {
         eprintln!("─────────────────────────────────────────────────────────");
         eprintln!("✨ Done in {:.1}s  ({:.0} records/s)", elapsed, rate);
         eprintln!("   ✅  Written to binpack : {total_written}");
-        eprintln!("   🚫  Skipped (FRC/var)  : {total_skipped_frc}");
-        eprintln!("   ⚠️   Skipped (error)    : {total_skipped_err}");
+        eprintln!("   🚫  Skipped            : {}", total_skipped_frc + total_skipped_err);
         eprintln!("─────────────────────────────────────────────────────────");
     }
 }
