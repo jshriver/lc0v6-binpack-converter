@@ -246,15 +246,53 @@ fn resolve_backprop_mode(backpropagate: bool, limit: Option<u16>) -> BackpropMod
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
+/// Running sum of an `f64`-accumulated field that tolerates `NaN` inputs.
+///
+/// A naive running sum (`sum += x`) is permanently poisoned by a single
+/// `NaN`: `NaN + anything` is `NaN`, so one bad record turns the average
+/// for the entire run into `NaN`, silently discarding every other record's
+/// contribution. `orig_q`/`orig_d`/`orig_m` are documented as "may be NaN
+/// if not cached" in `record.rs`, and in practice `root_q`/`root_d` and
+/// other fields can carry `NaN` too — so every averaged field in `Stats`
+/// uses this type instead of a bare `f64` sum.
+///
+/// `NaN` inputs are excluded from both the sum and the count, so the
+/// average is computed only over the records that actually had a valid
+/// value, and `nan_count` reports how many were excluded.
+#[derive(Default, Clone, Copy)]
+struct NanSafeSum {
+    sum:       f64,
+    valid:     usize,
+    nan_count: usize,
+}
+
+impl NanSafeSum {
+    fn add(&mut self, x: f64) {
+        if x.is_nan() {
+            self.nan_count += 1;
+        } else {
+            self.sum   += x;
+            self.valid += 1;
+        }
+    }
+
+    /// Average over valid (non-NaN) samples only, or `None` if every
+    /// sample seen so far was `NaN` (avoids a 0/0 division producing
+    /// `NaN` again).
+    fn mean(&self) -> Option<f64> {
+        if self.valid == 0 { None } else { Some(self.sum / self.valid as f64) }
+    }
+}
+
 #[derive(Default)]
 struct Stats {
     total_records:  usize,
     skipped_frc:    usize,
     total_visits:   u64,
-    sum_root_q:     f64,
-    sum_root_d:     f64,
-    sum_plies_left: f64,
-    sum_policy_kld: f64,
+    root_q:         NanSafeSum,
+    root_d:         NanSafeSum,
+    plies_left:     NanSafeSum,
+    policy_kld:     NanSafeSum,
     adjudicated:    usize,
     proven_best:    usize,
     version_counts: HashMap<u32, usize>,
@@ -263,16 +301,39 @@ struct Stats {
 
 impl Stats {
     fn update(&mut self, rec: &V6Record) {
-        self.total_records  += 1;
-        self.total_visits   += rec.visits as u64;
-        self.sum_root_q     += rec.root_q as f64;
-        self.sum_root_d     += rec.root_d as f64;
-        self.sum_plies_left += rec.plies_left as f64;
-        self.sum_policy_kld += rec.policy_kld as f64;
+        self.total_records += 1;
+        self.total_visits  += rec.visits as u64;
+        self.root_q.add(rec.root_q as f64);
+        self.root_d.add(rec.root_d as f64);
+        self.plies_left.add(rec.plies_left as f64);
+        self.policy_kld.add(rec.policy_kld as f64);
         if rec.game_adjudicated() { self.adjudicated += 1; }
         if rec.best_q_is_proven() { self.proven_best += 1; }
         *self.version_counts.entry(rec.version).or_insert(0) += 1;
         *self.format_counts.entry(rec.input_format).or_insert(0) += 1;
+    }
+
+    /// Print one "Avg <label> : <value>" line, or a clear placeholder plus
+    /// a NaN-skip count if every sample for that field was `NaN`.
+    fn print_avg_line(label: &str, field: &NanSafeSum, fmt_value: impl Fn(f64) -> String) {
+        match field.mean() {
+            Some(m) => {
+                if field.nan_count > 0 {
+                    println!(
+                        "║ {label:<18}: {} (skipped {} NaN of {})",
+                        fmt_value(m), field.nan_count, field.valid + field.nan_count
+                    );
+                } else {
+                    println!("║ {label:<18}: {}", fmt_value(m));
+                }
+            }
+            None => {
+                println!(
+                    "║ {label:<18}: N/A (all {} records had NaN)",
+                    field.nan_count
+                );
+            }
+        }
     }
 
     fn print(&self) {
@@ -288,10 +349,10 @@ impl Stats {
         println!("║ Total visits      : {}", self.total_visits);
         if self.total_records > 0 {
             println!("║ Avg visits/record : {:.1}", self.total_visits as f64 / n);
-            println!("║ Avg root Q        : {:+.4}", self.sum_root_q / n);
-            println!("║ Avg root D        : {:.4}", self.sum_root_d / n);
-            println!("║ Avg plies left    : {:.1}", self.sum_plies_left / n);
-            println!("║ Avg policy KLD    : {:.6}", self.sum_policy_kld / n);
+            Self::print_avg_line("Avg root Q", &self.root_q, |v| format!("{v:+.4}"));
+            Self::print_avg_line("Avg root D", &self.root_d, |v| format!("{v:.4}"));
+            Self::print_avg_line("Avg plies left", &self.plies_left, |v| format!("{v:.1}"));
+            Self::print_avg_line("Avg policy KLD", &self.policy_kld, |v| format!("{v:.6}"));
             println!("║ Adjudicated       : {} ({:.1}%)", self.adjudicated,
                      self.adjudicated as f64 / n * 100.0);
             println!("║ Proven best move  : {} ({:.1}%)", self.proven_best,
