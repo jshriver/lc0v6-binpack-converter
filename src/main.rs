@@ -12,7 +12,6 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
-
 mod binpack;
 mod fen;
 mod moves;
@@ -23,9 +22,10 @@ mod syzygy;
 
 use record::{V6Record, RECORD_SIZE};
 use printer::{Verbosity, print_record};
-use binpack::BinpackWriter;
+use binpack::{BackpropMode, BinpackWriter};
 use progress::Progress;
-use syzygy::SyzygyProber;
+use syzygy::{SyzygyProber, TableInventory};
+
 use std::{
     collections::HashMap,
     env,
@@ -34,6 +34,7 @@ use std::{
     path::PathBuf,
     process,
 };
+
 use flate2::read::GzDecoder;
 
 const INPUT_CLASSICAL: u32 = 1;
@@ -49,7 +50,10 @@ struct Args {
     summary:       bool,
     output:        Option<PathBuf>,
     syzygy_path:   Option<PathBuf>,
-    backpropagate: bool,
+    /// Resolved once during arg parsing from `--backpropagate` and
+    /// `--backpropagate-limit` — see `resolve_backprop_mode` for the
+    /// precedence rule between the two flags.
+    backprop_mode: BackpropMode,
     _input_dir:    Option<PathBuf>,
 }
 
@@ -77,6 +81,16 @@ fn usage(prog: &str) -> ! {
                                       backward to move 1 (requires --syzygy-path).\n\
                                       Without this flag only forward propagation\n\
                                       (hit ply → end of game) is applied.\n\
+           --backpropagate-limit N    Like --backpropagate, but only patches the\n\
+                                      N plies immediately before the hit instead\n\
+                                      of going all the way back to move 1. Implies\n\
+                                      --backpropagate is enabled on its own — you\n\
+                                      don't need both. If both are given, the\n\
+                                      limit wins (backprop is capped at N plies).\n\
+                                      Bounds the assumption that the game's result\n\
+                                      was already decided arbitrarily far before\n\
+                                      the TB hit, which becomes less reliable the\n\
+                                      further back you go.\n\
            -h, --help                 Show this help\n\
          \n\
          Without -b/-n/-f, shows a live progress bar instead of per-record output.\n\
@@ -92,6 +106,8 @@ fn usage(prog: &str) -> ! {
            {prog} -d /data/training -o out.binpack --syzygy-path /tb/syzygy\n\
            # Export with full back+forward propagation\n\
            {prog} -d /data/training -o out.binpack --syzygy-path /tb/syzygy --backpropagate\n\
+           # Export with backprop capped at 30 plies before each TB hit\n\
+           {prog} -d /data/training -o out.binpack --syzygy-path /tb/syzygy --backpropagate-limit 30\n\
            # Inspect first 10 records of a single file\n\
            {prog} --normal --limit 10 game.gz\n\
            # Mix directory and explicit files\n\
@@ -103,17 +119,19 @@ fn usage(prog: &str) -> ! {
 fn parse_args() -> Args {
     let raw: Vec<String> = env::args().collect();
     let prog = raw.first().map(String::as_str).unwrap_or("lc0_parser");
-    let mut files         = Vec::new();
-    let mut verbosity     = None;
-    let mut limit         = None;
-    let mut skip          = 0usize;
-    let mut summary       = false;
-    let mut output        = None;
-    let mut syzygy_path   = None;
-    let mut backpropagate = false;
-    let mut input_dir     = None;
-    let mut i             = 1;
 
+    let mut files             = Vec::new();
+    let mut verbosity         = None;
+    let mut limit             = None;
+    let mut skip              = 0usize;
+    let mut summary           = false;
+    let mut output            = None;
+    let mut syzygy_path       = None;
+    let mut backpropagate     = false;
+    let mut backpropagate_lim: Option<u16> = None;
+    let mut input_dir         = None;
+
+    let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
             "-h" | "--help"   => usage(prog),
@@ -122,6 +140,12 @@ fn parse_args() -> Args {
             "-f" | "--full"   => verbosity = Some(Verbosity::Full),
             "--summary"       => summary = true,
             "--backpropagate" => backpropagate = true,
+            "--backpropagate-limit" => {
+                i += 1;
+                backpropagate_lim = Some(raw.get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| { eprintln!("--backpropagate-limit needs an integer (plies)"); process::exit(1); }));
+            }
             "-l" | "--limit"  => {
                 i += 1;
                 limit = Some(raw.get(i)
@@ -195,11 +219,29 @@ fn parse_args() -> Args {
         usage(prog);
     }
 
-    if backpropagate && syzygy_path.is_none() {
-        eprintln!("Warning: --backpropagate has no effect without --syzygy-path.");
+    let backprop_mode = resolve_backprop_mode(backpropagate, backpropagate_lim);
+
+    if backprop_mode.is_enabled() && syzygy_path.is_none() {
+        eprintln!("Warning: --backpropagate/--backpropagate-limit has no effect without --syzygy-path.");
     }
 
-    Args { files, verbosity, limit, skip, summary, output, syzygy_path, backpropagate, _input_dir: input_dir }
+    Args { files, verbosity, limit, skip, summary, output, syzygy_path, backprop_mode, _input_dir: input_dir }
+}
+
+/// Resolve `--backpropagate` and `--backpropagate-limit` into a single
+/// `BackpropMode`, per this precedence:
+///   - limit given (regardless of `--backpropagate`) → `Limited(n)`.
+///     `--backpropagate-limit` alone is sufficient to enable backprop;
+///     you don't need `--backpropagate` too. If both are given, the
+///     limit wins — it's strictly more specific than "unlimited".
+///   - `--backpropagate` alone (no limit)            → `Unlimited`.
+///   - neither flag                                  → `Off`.
+fn resolve_backprop_mode(backpropagate: bool, limit: Option<u16>) -> BackpropMode {
+    match limit {
+        Some(n) => BackpropMode::Limited(n),
+        None if backpropagate => BackpropMode::Unlimited,
+        None => BackpropMode::Off,
+    }
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -345,7 +387,6 @@ fn process_file(
 
         let rec_idx = *global_index;
         *global_index += 1;
-
         let rec_ply = ply;
         ply = ply.saturating_add(1);
 
@@ -392,7 +433,7 @@ fn process_file(
 
     // End of game (file) — flush the game buffer with TB propagation.
     if let Some(w) = writer.as_mut() {
-        if let Err(e) = w.flush_game(args.backpropagate) {
+        if let Err(e) = w.flush_game(args.backprop_mode) {
             eprintln!("  ⚠️  Error flushing game for {filename}: {e}");
         }
     }
@@ -424,10 +465,25 @@ fn main() {
         match SyzygyProber::load(sz_path) {
             Ok(p) => {
                 eprintln!("♟  Syzygy: tables loaded from {}", sz_path.display());
-                if args.backpropagate {
-                    eprintln!("♟  Syzygy: backward propagation enabled");
+                let inv: TableInventory = p.inventory();
+                if inv.file_count > 0 {
+                    eprintln!(
+                        "♟  Syzygy: found {} table files (up to {}-men)",
+                        inv.file_count, inv.max_pieces
+                    );
                 } else {
-                    eprintln!("♟  Syzygy: forward propagation only (use --backpropagate for full game)");
+                    eprintln!("♟  Syzygy: warning — 0 table files found under the given path(s)");
+                }
+                match args.backprop_mode {
+                    BackpropMode::Off => {
+                        eprintln!("♟  Syzygy: forward propagation only (use --backpropagate or --backpropagate-limit N to also patch earlier plies)");
+                    }
+                    BackpropMode::Unlimited => {
+                        eprintln!("♟  Syzygy: backward propagation enabled (unlimited, back to move 1)");
+                    }
+                    BackpropMode::Limited(n) => {
+                        eprintln!("♟  Syzygy: backward propagation enabled (limited to {n} plies before each hit)");
+                    }
                 }
                 p
             }
@@ -470,20 +526,25 @@ fn main() {
 
     if let Some(w) = writer.as_mut() {
         w.flush();
-        let tb_hits   = w.tb_hits();
-        let wdl_orig  = w.wdl_original;
-        let wdl_corr  = w.wdl_corrected;
+        let tb_hits             = w.tb_hits();
+        let positions_corrected = w.positions_corrected();
+        let wdl_orig             = w.wdl_original;
+        let wdl_corr             = w.wdl_corrected;
+
         if let Some(p) = prog.as_ref() {
             p.finish(w.written(), stats.skipped_frc, w.skipped());
         } else {
             eprintln!("💾 Binpack: {} written, {} skipped", w.written(), w.skipped());
         }
+
         eprintln!(
             "📊 Original  WDL  — wins: {:>8}  draws: {:>8}  losses: {:>8}",
             wdl_orig.wins, wdl_orig.draws, wdl_orig.losses
         );
+
         if prober.is_loaded() {
-            eprintln!("♟  Syzygy: {} TB hits applied", tb_hits);
+            eprintln!("♟  Syzygy: {tb_hits} games had a TB hit");
+            eprintln!("♟  Syzygy: {positions_corrected} positions corrected by propagation");
             eprintln!(
                 "📊 Corrected WDL  — wins: {:>8}  draws: {:>8}  losses: {:>8}",
                 wdl_corr.wins, wdl_corr.draws, wdl_corr.losses

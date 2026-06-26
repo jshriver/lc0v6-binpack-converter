@@ -1,0 +1,14 @@
+This is a real tradeoff, not a "more is always better" situation — let me lay out what each actually buys and costs you as training signal.
+What forward-only gives you
+Once a Syzygy hit occurs at ply N, everything from N to the end of the game is provably correct — it's now inside the tablebase's perfect-play horizon, so the game-theoretic outcome from that point forward is known with certainty, not estimated. Forward propagation is low-risk: you're only ever replacing data with something strictly more accurate, because once you're in tablebase territory, perfect play (or even imperfect but TB-confirmed) play makes the remaining outcome deterministic from a game-theoretic standpoint.
+What backpropagation additionally assumes
+Backprop's implicit assumption is much stronger: it assumes that every position before the hit, all the way back to move 1, would have had the same game-theoretic outcome under perfect play. That's not actually guaranteed. A position 80 plies before the TB hit might have been a theoretical draw that one side then misplayed into a loss, or a theoretical win that got squandered into a draw before later somehow being recovered (less likely but possible with non-monotonic eval). The mainline that was actually played determines what happened, but the correctness of treating the whole prefix as "leading to this outcome under perfect play" requires the assumption that no side ever let the win/draw/loss status change hands before the probed position. That assumption can be wrong, especially in:
+
+Long games with swingy middlegames where the eval (and true status) genuinely flips multiple times before either side reaches a TB-coverable endgame.
+Adjudicated games — if adjudication ended the game early based on eval/visit heuristics rather than actual play to a TB position, the "result" being backpropagated might already be a guess, and you're now spreading that guess's correction backward through positions that had nothing to do with the endgame technique.
+
+What this means for training signal
+
+Forward-only is the conservative, always-correct choice: it improves label quality for the tail of games without risking incorrect labels elsewhere.
+Backpropagation can meaningfully improve very long games where a clearly winning/losing position was reached early and never realistically changed hands (e.g., a piece up by move 20 in an otherwise quiet position, never traded down to drawn material) — there, backprop correctly relabels a long stretch of positions that lc0 may have under/over-valued.
+But backpropagation can also inject incorrect labels into positions where the game's status genuinely was different earlier (swings, blunders, recoveries) — and you have no signal in this pipeline (FEN + best move + Q) to detect when that assumption breaks down. You're trusting that "if the endgame was a win, the whole game must have been winning," which isn't true in general chess.

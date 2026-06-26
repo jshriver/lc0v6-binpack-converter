@@ -12,7 +12,6 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
-
 //! Convert V6TrainingData records to Stockfish binpack format.
 //!
 //! Uses the sfbinpack crate's CompressedTrainingDataEntryWriter.
@@ -81,8 +80,14 @@
 //!
 //! - All positions from the hit forward to end-of-game have their result
 //!   patched to the TB value (with sign flipped per ply, STM-relative).
-//! - If `--backpropagate` is set, all positions from the hit backward to
-//!   move 0 are also patched (again flipping sign per ply from the hit).
+//! - Backward from the hit, behavior depends on `BackpropMode` (see that
+//!   type for the precedence rules between `--backpropagate` and
+//!   `--backpropagate-limit`):
+//!     - `Off`: no backward propagation (forward-only, the default).
+//!     - `Unlimited` (`--backpropagate`): all positions from the hit
+//!       backward to move 0 are patched.
+//!     - `Limited(n)` (`--backpropagate-limit n`): only the `n` plies
+//!       immediately preceding the hit are patched.
 //!
 //! Probing stops after the first hit — no further disk I/O is needed since
 //! the WDL outcome is monotonically consistent along the mainline.
@@ -90,9 +95,26 @@
 //! ## Game buffer
 //!
 //! To support result patching we buffer all entries for a game before writing.
-//! Call `flush_game(backpropagate)` at the end of each game (i.e. each .gz
+//! Call `flush_game(mode)` at the end of each game (i.e. each .gz
 //! file) and `flush()` once at the very end to finalise the stream.
-
+//!
+//! ## Stats: `tb_hits` vs `positions_corrected`
+//!
+//! These two counters answer different questions and are easy to conflate:
+//!
+//! - `tb_hits` counts **games** that produced at least one Syzygy probe hit.
+//!   Since probing stops the moment a game gets its first hit (see
+//!   `buffer_record`), this can only ever be incremented once per game — it
+//!   does *not* grow with `--backpropagate`, because backpropagation doesn't
+//!   create more hits, it just makes existing hits reach further.
+//! - `positions_corrected` counts **individual training positions** whose
+//!   result differs from the original lc0 `result_q` after propagation.
+//!   This is the number that actually grows when `--backpropagate` is set,
+//!   since a single hit near the end of a long game can now patch every
+//!   position back to move 1 instead of just the tail of the game.
+//!
+//! Use `tb_hits` to answer "how many games touched a tablebase position" and
+//! `positions_corrected` to answer "how much of my dataset did this change."
 use std::fs::OpenOptions;
 use std::{fs::File, io::{self, BufWriter}, path::Path};
 use sfbinpack::{
@@ -200,7 +222,6 @@ fn parse_uci_move(uci: &str, pos: &Position) -> Result<Move, BinpackError> {
     if uci.len() < 4 || uci.len() > 5 {
         return Err(BinpackError::InvalidMove(format!("bad length: {uci}")));
     }
-
     let from = Square::from_string(&uci[0..2])
         .ok_or_else(|| BinpackError::InvalidMove(format!("bad from square: {uci}")))?;
     let to = Square::from_string(&uci[2..4])
@@ -226,7 +247,6 @@ fn parse_uci_move(uci: &str, pos: &Position) -> Result<Move, BinpackError> {
         let file_diff = (to.index() & 7) as i32 - (from.index() & 7) as i32;
         if file_diff.abs() > 1 {
             let color = pos.side_to_move();
-
             let expected_king_sq = match color {
                 Color::White => Square::E1,
                 Color::Black => Square::E8,
@@ -236,7 +256,6 @@ fn parse_uci_move(uci: &str, pos: &Position) -> Result<Move, BinpackError> {
                     "king on {from:?} (not e1/e8) moved {file_diff:+} files: {uci}"
                 )));
             }
-
             let kingside = file_diff > 0;
             let has_right = if kingside {
                 pos.castling_rights().contains(
@@ -247,7 +266,6 @@ fn parse_uci_move(uci: &str, pos: &Position) -> Result<Move, BinpackError> {
                     CastlingTraits::castling_rights(color, CastleType::Long)
                 )
             };
-
             if has_right {
                 let rook_sq = match (kingside, color) {
                     (true,  Color::White) => Square::H1,
@@ -329,25 +347,21 @@ fn check_legal_standard_chess(uci: &str, fen: &str) -> Result<LegalityResult, Bi
     let shakmaty_pos = Fen::from_ascii(fen.as_bytes())
         .ok()
         .and_then(|f| f.into_position::<Chess>(CastlingMode::Standard).ok());
-
     let pos = match shakmaty_pos {
         Some(p) => p,
         None => return Err(BinpackError::FrcCastle(format!(
             "position invalid in standard chess (FRC): {fen}"
         ))),
     };
-
     let is_legal = uci.parse::<ShakmatyUci>()
         .ok()
         .and_then(|m| m.to_move(&pos).ok())
         .is_some();
-
     if !is_legal {
         return Err(BinpackError::FrcCastle(format!(
             "move {uci} illegal in standard chess (FRC): {fen}"
         )));
     }
-
     Ok(LegalityResult { shakmaty_pos: pos })
 }
 
@@ -418,6 +432,41 @@ fn record_to_converted(
     Ok(ConvertedEntry { entry, tb_result })
 }
 
+// ── Backpropagation mode ──────────────────────────────────────────────────────
+
+/// How far Syzygy results are propagated backward from a TB hit.
+///
+/// Forward propagation (hit → end of game) always happens once there's a
+/// hit; this enum only controls the backward direction (hit → start of
+/// game), since that's the direction whose correctness depends on the
+/// (sometimes false) assumption that the game's outcome was already
+/// decided arbitrarily far before the hit. See module docs and the
+/// `--backpropagate-limit` usage text for the reasoning.
+///
+/// Precedence (decided once in `main.rs`, then threaded through as this
+/// single enum so the call sites never have to re-derive it):
+///   - `--backpropagate-limit N` alone or combined with `--backpropagate`
+///     → `Limited(N)`. The explicit limit always wins.
+///   - `--backpropagate` alone → `Unlimited` (back to move 0, current
+///     long-standing behavior).
+///   - Neither flag → `Off` (forward-only, the default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackpropMode {
+    /// No backward propagation. Forward-only.
+    Off,
+    /// Backward propagation with no distance limit — all the way to move 0.
+    Unlimited,
+    /// Backward propagation limited to this many plies before the hit.
+    Limited(u16),
+}
+
+impl BackpropMode {
+    /// `true` for any mode other than `Off`.
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, BackpropMode::Off)
+    }
+}
+
 // ── Buffered game entry ───────────────────────────────────────────────────────
 
 /// One position buffered for a game, ready to be patched and written.
@@ -434,8 +483,17 @@ struct BufferedEntry {
 /// Strategy:
 /// 1. Find the first entry index where `tb_result` is `Some`.
 /// 2. From that index forward (to end): set result to the TB value,
-///    flipping sign for each ply step away from the hit.
-/// 3. If `backpropagate`: from that index backward (to start): same logic.
+///    flipping sign for each ply step away from the hit. Always happens
+///    once there's a hit — forward propagation never carries the "was the
+///    outcome already decided this far back" risk that backward does,
+///    since everything from the hit forward is inside the TB-proven
+///    horizon.
+/// 3. Backward from that index (toward start), per `mode`:
+///      - `BackpropMode::Off`        → no backward propagation at all.
+///      - `BackpropMode::Unlimited`  → all the way to move 0.
+///      - `BackpropMode::Limited(n)` → only the `n` plies immediately
+///        preceding the hit. This bounds how far we extrapolate the
+///        assumption that the game's status was already settled.
 ///
 /// The sign convention is STM-relative throughout.  At the hit ply the
 /// TB result is correct for the STM at that ply.  One ply earlier the
@@ -447,30 +505,51 @@ struct BufferedEntry {
 /// Which in integer arithmetic is:
 ///   if (hit_ply - n) is even  → same sign as tb_result
 ///   if (hit_ply - n) is odd   → negated
-fn propagate_tb_result(entries: &mut Vec<BufferedEntry>, backpropagate: bool) {
+///
+/// Returns the number of entries whose `result` field actually changed
+/// value as a result of this call (0 if there was no TB hit, or if the
+/// TB-derived result happened to match what was already there).
+fn propagate_tb_result(entries: &mut Vec<BufferedEntry>, mode: BackpropMode) -> usize {
     // Find the first TB hit.
     let hit_idx = match entries.iter().position(|e| e.tb_result.is_some()) {
         Some(i) => i,
-        None    => return,  // No TB hit in this game — nothing to do.
+        None    => return 0,  // No TB hit in this game — nothing to do.
     };
-
     let tb_result = entries[hit_idx].tb_result.unwrap();
+    let mut changed = 0usize;
 
     // Propagate forward from the hit (inclusive) to end-of-game.
     for (offset, e) in entries[hit_idx..].iter_mut().enumerate() {
         // offset 0 → hit ply, sign unchanged.
         // offset 1 → one ply after hit, opponent STM, sign flipped.
-        e.entry.result = if offset % 2 == 0 { tb_result } else { -tb_result };
+        let new_result = if offset % 2 == 0 { tb_result } else { -tb_result };
+        if e.entry.result != new_result {
+            changed += 1;
+        }
+        e.entry.result = new_result;
     }
 
-    // Propagate backward from the hit (exclusive) to start-of-game.
-    if backpropagate && hit_idx > 0 {
-        for (offset, e) in entries[..hit_idx].iter_mut().rev().enumerate() {
+    // Propagate backward from the hit (exclusive) to start-of-game, or to
+    // the configured limit — whichever comes first.
+    if mode.is_enabled() && hit_idx > 0 {
+        let backward_reach: usize = match mode {
+            BackpropMode::Off        => 0, // unreachable due to is_enabled() guard above
+            BackpropMode::Unlimited  => hit_idx,
+            BackpropMode::Limited(n) => (n as usize).min(hit_idx),
+        };
+        let start = hit_idx - backward_reach;
+        for (offset, e) in entries[start..hit_idx].iter_mut().rev().enumerate() {
             // offset 0 → one ply before hit, sign flipped.
             // offset 1 → two plies before hit, sign unchanged.
-            e.entry.result = if offset % 2 == 0 { -tb_result } else { tb_result };
+            let new_result = if offset % 2 == 0 { -tb_result } else { tb_result };
+            if e.entry.result != new_result {
+                changed += 1;
+            }
+            e.entry.result = new_result;
         }
     }
+
+    changed
 }
 
 // ── WDL counters ──────────────────────────────────────────────────────────────
@@ -501,14 +580,21 @@ impl WdlCounts {
 /// Writes V6Records to a `.binpack` file, appending if the file already exists.
 ///
 /// Records are buffered per game (one `.gz` file = one game).  Call
-/// `flush_game(backpropagate)` at the end of each game and `flush()` once
+/// `flush_game(mode)` at the end of each game and `flush()` once
 /// at the very end to finalise the stream.
 pub struct BinpackWriter {
-    inner:             Option<CompressedTrainingDataEntryWriter<BufWriter<File>>>,
-    game_buf:          Vec<BufferedEntry>,
-    written:           usize,
-    skipped:           usize,
-    tb_hits:           usize,
+    inner:                Option<CompressedTrainingDataEntryWriter<BufWriter<File>>>,
+    game_buf:             Vec<BufferedEntry>,
+    written:              usize,
+    skipped:              usize,
+    /// Number of games that produced at least one Syzygy probe hit.
+    /// Capped at one increment per game — see module docs for why this
+    /// does NOT grow with `--backpropagate`.
+    tb_hits:              usize,
+    /// Number of individual positions whose result differs from the
+    /// original lc0 `result_q` after propagation. This is the number
+    /// that grows when `--backpropagate` is set. See module docs.
+    positions_corrected:  usize,
     /// WDL counts from the original lc0 result_q values (before any TB patch).
     pub wdl_original:  WdlCounts,
     /// WDL counts from the final result written to binpack (after TB patch).
@@ -522,18 +608,17 @@ impl BinpackWriter {
             .create(true)
             .append(true)
             .open(path)?;
-
         let inner = CompressedTrainingDataEntryWriter::new(BufWriter::new(file))
             .map_err(|e| BinpackError::Writer(e.to_string()))?;
-
         Ok(Self {
-            inner:         Some(inner),
-            game_buf:      Vec::new(),
-            written:       0,
-            skipped:       0,
-            tb_hits:       0,
-            wdl_original:  WdlCounts::default(),
-            wdl_corrected: WdlCounts::default(),
+            inner:               Some(inner),
+            game_buf:            Vec::new(),
+            written:             0,
+            skipped:             0,
+            tb_hits:             0,
+            positions_corrected: 0,
+            wdl_original:        WdlCounts::default(),
+            wdl_corrected:       WdlCounts::default(),
         })
     }
 
@@ -559,13 +644,8 @@ impl BinpackWriter {
     ) -> Result<(bool, bool), BinpackError> {
         // Once we have a TB hit in this game we stop probing to avoid
         // unnecessary disk I/O.  Achieve this by passing a disabled prober.
-        let effective_prober: &SyzygyProber;
         let disabled = SyzygyProber::disabled();
-        if tb_hit_found {
-            effective_prober = &disabled;
-        } else {
-            effective_prober = prober;
-        }
+        let effective_prober: &SyzygyProber = if tb_hit_found { &disabled } else { prober };
 
         match record_to_converted(rec, ply, effective_prober) {
             Ok(converted) => {
@@ -589,21 +669,24 @@ impl BinpackWriter {
 
     /// Flush the current game buffer to the binpack stream.
     ///
-    /// Applies Syzygy result propagation (forward always; backward if
-    /// `backpropagate` is `true`), then writes all buffered entries.
+    /// Applies Syzygy result propagation (forward always; backward per
+    /// `mode` — see `BackpropMode`), then writes all buffered entries.
     ///
     /// Tallies `wdl_original` from the pre-propagation results and
-    /// `wdl_corrected` from the final written results.
+    /// `wdl_corrected` from the final written results, and accumulates
+    /// `positions_corrected` by counting how many entries' results
+    /// actually changed value during propagation.
     ///
     /// Call this once per game (i.e. once per `.gz` file).
-    pub fn flush_game(&mut self, backpropagate: bool) -> Result<(), BinpackError> {
+    pub fn flush_game(&mut self, mode: BackpropMode) -> Result<(), BinpackError> {
         // Snapshot original results before any TB patching.
         for e in &self.game_buf {
             self.wdl_original.tally(e.entry.result);
         }
 
-        // Patch results using TB hits (if any).
-        propagate_tb_result(&mut self.game_buf, backpropagate);
+        // Patch results using TB hits (if any), and record how many
+        // positions actually changed as a result.
+        self.positions_corrected += propagate_tb_result(&mut self.game_buf, mode);
 
         let writer = self.inner.as_mut().expect("flush_game called after flush");
         for buffered in self.game_buf.drain(..) {
@@ -614,7 +697,6 @@ impl BinpackWriter {
                 .map_err(|e| BinpackError::Writer(e.to_string()))?;
             self.written += 1;
         }
-
         Ok(())
     }
 
@@ -625,9 +707,14 @@ impl BinpackWriter {
         }
     }
 
-    pub fn written(&self)  -> usize { self.written  }
-    pub fn skipped(&self)  -> usize { self.skipped  }
-    pub fn tb_hits(&self)  -> usize { self.tb_hits  }
+    pub fn written(&self)             -> usize { self.written }
+    pub fn skipped(&self)             -> usize { self.skipped }
+    /// Number of games with at least one Syzygy probe hit. Does not grow
+    /// with `--backpropagate` — see module docs for `positions_corrected`.
+    pub fn tb_hits(&self)             -> usize { self.tb_hits }
+    /// Number of individual positions whose result was changed by Syzygy
+    /// propagation. This is the number that grows with `--backpropagate`.
+    pub fn positions_corrected(&self) -> usize { self.positions_corrected }
 }
 
 impl Drop for BinpackWriter {

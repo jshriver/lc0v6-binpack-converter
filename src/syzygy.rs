@@ -12,7 +12,6 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
-
 //! Syzygy endgame tablebase probe wrapper.
 //!
 //! ## Feature flag
@@ -39,6 +38,26 @@
 //!
 //! The returned value is **side-to-move relative**, matching the convention
 //! of `TrainingDataEntry::result` in sfbinpack.
+//!
+//! ## Load-time table inventory
+//!
+//! `load()` reports how many table files it found and the largest piece
+//! count among them (e.g. "found 1742 tables, up to 6-men"). Both numbers
+//! come directly from `shakmaty_syzygy::Tablebase`'s own API rather than
+//! anything we infer ourselves:
+//!
+//! - `Tablebase::add_directory()` returns `io::Result<usize>`, where the
+//!   `usize` is the count of table files it added from that directory.
+//!   Summing this across all configured directories gives `file_count`.
+//! - `Tablebase::max_pieces()` returns the largest material count seen
+//!   across every table file added so far. It's a plain field on the
+//!   struct that's updated via `max(self.max_pieces, pieces)` each time a
+//!   file is added, so it's fully data-driven — calling it once after all
+//!   directories are loaded gives the true maximum across everything we
+//!   loaded, not a hardcoded constant.
+//!
+//! (Verified against the vendored source for shakmaty-syzygy 0.24.0 and
+//! 0.28.1; both versions expose the same signatures.)
 
 // ── Feature-enabled implementation ───────────────────────────────────────────
 
@@ -51,6 +70,19 @@ mod inner {
     /// Maximum piece count for which Syzygy tables exist.
     const MAX_PIECES: usize = 7;
 
+    /// Summary of the table files discovered at load time.
+    #[derive(Default, Clone, Copy)]
+    pub struct TableInventory {
+        /// Total number of table files added, summed across all configured
+        /// directories (each directory's contribution comes straight from
+        /// `Tablebase::add_directory`'s return value).
+        pub file_count:   usize,
+        /// Largest material count (`max_pieces()`) across every table file
+        /// added. `0` if no tables were found (mirrors the crate's own
+        /// default of `0` before any file is added).
+        pub max_pieces:   usize,
+    }
+
     /// Thin wrapper around a `shakmaty_syzygy::Tablebase<Chess>`.
     ///
     /// Constructed once at startup and shared for the lifetime of the run.
@@ -58,14 +90,19 @@ mod inner {
     /// on every position until the first hit, after which the caller should
     /// stop probing and propagate the result.
     pub struct SyzygyProber {
-        tables: Tablebase<Chess>,
-        loaded: bool,
+        tables:    Tablebase<Chess>,
+        loaded:    bool,
+        inventory: TableInventory,
     }
 
     impl SyzygyProber {
         /// Create a prober with no tables loaded.  All probes will return `None`.
         pub fn disabled() -> Self {
-            Self { tables: Tablebase::new(), loaded: false }
+            Self {
+                tables:    Tablebase::new(),
+                loaded:    false,
+                inventory: TableInventory::default(),
+            }
         }
 
         /// Load all `.rtbw` / `.rtbz` files found under one or more paths.
@@ -75,23 +112,43 @@ mod inner {
         /// Each directory is added in order; duplicates are harmless.
         ///
         /// Returns an error string if any directory cannot be read.
+        ///
+        /// On success, also builds a `TableInventory` from the same calls
+        /// used to load the tables: `file_count` is the sum of each
+        /// `add_directory()` call's returned file count, and `max_pieces`
+        /// is read once via `Tablebase::max_pieces()` after every directory
+        /// has been added.
         pub fn load(path: &Path) -> Result<Self, String> {
             let separator = if cfg!(windows) { ';' } else { ':' };
             let path_str  = path.to_string_lossy();
             let dirs: Vec<&str> = path_str.split(separator).collect();
 
             let mut tables = Tablebase::new();
+            let mut file_count = 0usize;
+
             for dir in &dirs {
                 let p = std::path::Path::new(dir);
-                tables
+                let added = tables
                     .add_directory(p)
                     .map_err(|e| format!("syzygy: failed to load {}: {e}", p.display()))?;
+                file_count += added;
             }
-            Ok(Self { tables, loaded: true })
+
+            let inventory = TableInventory {
+                file_count,
+                max_pieces: tables.max_pieces(),
+            };
+
+            Ok(Self { tables, loaded: true, inventory })
         }
 
         /// Returns `true` if any tables were loaded.
         pub fn is_loaded(&self) -> bool { self.loaded }
+
+        /// Inventory of table files discovered at load time (file count and
+        /// the largest material count among them). Zeroed if `load()` was
+        /// never called successfully.
+        pub fn inventory(&self) -> TableInventory { self.inventory }
 
         /// Probe the position described by `fen`.
         ///
@@ -107,13 +164,11 @@ mod inner {
             if !self.loaded {
                 return None;
             }
-
             // Skip positions with too many pieces — no table can cover them.
             let piece_count = shakmaty_pos.board().occupied().count();
             if piece_count > MAX_PIECES {
                 return None;
             }
-
             match self.tables.probe_wdl_after_zeroing(shakmaty_pos) {
                 Ok(wdl) => Some(wdl.signum() as i16),
                 Err(_)  => None,
@@ -129,6 +184,12 @@ mod inner {
     use std::path::Path;
     use shakmaty::Chess;
 
+    #[derive(Default, Clone, Copy)]
+    pub struct TableInventory {
+        pub file_count: usize,
+        pub max_pieces: usize,
+    }
+
     pub struct SyzygyProber;
 
     impl SyzygyProber {
@@ -137,9 +198,10 @@ mod inner {
             Err("syzygy feature not compiled in".to_string())
         }
         pub fn is_loaded(&self) -> bool { false }
+        pub fn inventory(&self) -> TableInventory { TableInventory::default() }
         pub fn probe(&self, _fen: &str, _pos: &Chess) -> Option<i16> { None }
     }
 }
 
-// Re-export so callers just use `syzygy::SyzygyProber`.
-pub use inner::SyzygyProber;
+// Re-export so callers just use `syzygy::SyzygyProber` / `syzygy::TableInventory`.
+pub use inner::{SyzygyProber, TableInventory};
