@@ -1,15 +1,20 @@
 [package]
 name = "lc0v6-binpack-converter"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 description = "Converts lc0 V6 training data files into .binpack format suitable for stockfish and bullet training"
-license = "GPL-3.0s"
+license = "GPL-3.0"
 
 [[bin]]
 name = "lc0v6-binpack-converter"
 path = "src/main.rs"
 
+[features]
+default = ["syzygy"]
+syzygy = ["dep:shakmaty-syzygy"]
+
 [dependencies]
 flate2 = "1"
 sfbinpack = "0.6.2"
 shakmaty = "0.30.1"
+shakmaty-syzygy = { version = "0.28", optional = true }

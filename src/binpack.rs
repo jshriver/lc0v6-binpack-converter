@@ -13,7 +13,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
-
 //! Convert V6TrainingData records to Stockfish binpack format.
 //!
 //! Uses the sfbinpack crate's CompressedTrainingDataEntryWriter.
@@ -41,6 +40,8 @@
 //!
 //! ## Result
 //!   Derived from result_q (+1 win, 0 draw, -1 loss, side-to-move perspective).
+//!   When Syzygy tables are loaded the first in-range probe hit overrides
+//!   result_q and is propagated through the game buffer (see below).
 //!
 //! ## Ply / chaining
 //!
@@ -72,6 +73,25 @@
 //! legality in standard chess.  If shakmaty rejects the move the record is
 //! an FRC position and is skipped.  This catches all FRC cases regardless of
 //! whether castling is involved or how far the king has moved.
+//!
+//! ## Syzygy tablebase integration
+//!
+//! When a `SyzygyProber` is provided and a position has ≤7 pieces, we probe
+//! the WDL value for that position.  On the first hit within a game:
+//!
+//! - All positions from the hit forward to end-of-game have their result
+//!   patched to the TB value (with sign flipped per ply, STM-relative).
+//! - If `--backpropagate` is set, all positions from the hit backward to
+//!   move 0 are also patched (again flipping sign per ply from the hit).
+//!
+//! Probing stops after the first hit — no further disk I/O is needed since
+//! the WDL outcome is monotonically consistent along the mainline.
+//!
+//! ## Game buffer
+//!
+//! To support result patching we buffer all entries for a game before writing.
+//! Call `flush_game(backpropagate)` at the end of each game (i.e. each .gz
+//! file) and `flush()` once at the very end to finalise the stream.
 
 use std::fs::OpenOptions;
 use std::{fs::File, io::{self, BufWriter}, path::Path};
@@ -92,6 +112,7 @@ use crate::{
     fen::record_to_fen,
     moves::MOVE_STRS,
     record::{V6Record, q_to_cp},
+    syzygy::SyzygyProber,
 };
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -286,7 +307,14 @@ fn result_q_to_result(result_q: f32) -> i16 {
     else                    {  0 }
 }
 
-// ── Shakmaty legality check ───────────────────────────────────────────────────
+// ── Shakmaty legality check + optional TB probe ───────────────────────────────
+
+/// Outcome of the shakmaty legality check, bundling the parsed position so
+/// the caller can pass it directly to the Syzygy prober without re-parsing.
+struct LegalityResult {
+    /// The validated shakmaty position.
+    shakmaty_pos: Chess,
+}
 
 /// Validate that a UCI move string is legal in standard chess using shakmaty.
 ///
@@ -294,7 +322,10 @@ fn result_q_to_result(result_q: f32) -> i16 {
 /// standard chess or the move is not legal.  This is the primary FRC filter —
 /// any position or move that is illegal in standard chess is assumed to be an
 /// FRC record that slipped through the classical input_format filter.
-fn check_legal_standard_chess(uci: &str, fen: &str) -> Result<(), BinpackError> {
+///
+/// On success, returns `LegalityResult` carrying the parsed `Chess` position
+/// so it can be reused for a Syzygy probe without parsing the FEN again.
+fn check_legal_standard_chess(uci: &str, fen: &str) -> Result<LegalityResult, BinpackError> {
     let shakmaty_pos = Fen::from_ascii(fen.as_bytes())
         .ok()
         .and_then(|f| f.into_position::<Chess>(CastlingMode::Standard).ok());
@@ -317,23 +348,35 @@ fn check_legal_standard_chess(uci: &str, fen: &str) -> Result<(), BinpackError> 
         )));
     }
 
-    Ok(())
+    Ok(LegalityResult { shakmaty_pos: pos })
 }
 
 // ── Entry construction ────────────────────────────────────────────────────────
 
-/// Convert a single V6Record to a TrainingDataEntry.
+/// A fully converted entry plus any Syzygy WDL result found at this position.
+struct ConvertedEntry {
+    entry:      TrainingDataEntry,
+    /// STM-relative result from the tablebase, if a probe hit occurred.
+    /// `None` means either no tables loaded, position had >7 pieces,
+    /// or position was not found in the tablebase.
+    tb_result:  Option<i16>,
+}
+
+/// Convert a single V6Record to a TrainingDataEntry, optionally probing
+/// the Syzygy tablebase.
 ///
 /// The FEN, move, and evaluation are all self-contained within one record.
 /// When Black is to move the move index is in flipped coordinates and must
 /// be mirrored vertically before being applied to the standard-orientation FEN.
 ///
-/// `ply` is the caller-tracked position of this record within its game (see
-/// `main.rs::process_file`) — 0 for the first record of a .gz file/game,
-/// incrementing by 1 per record thereafter. It's required for the binpack
-/// writer's chain-compression to kick in between consecutive moves of the
-/// same game; see the module docs above for the exact continuation rule.
-pub fn record_to_entry(rec: &V6Record, ply: u16) -> Result<TrainingDataEntry, BinpackError> {
+/// `ply` is the caller-tracked position of this record within its game.
+/// `prober` is the Syzygy tablebase prober; probe is skipped if `None` is
+/// passed or if `prober.probe()` returns `None` (e.g. >7 pieces, no hit).
+fn record_to_converted(
+    rec:    &V6Record,
+    ply:    u16,
+    prober: &SyzygyProber,
+) -> Result<ConvertedEntry, BinpackError> {
     let fen = record_to_fen(rec).map_err(BinpackError::Fen)?;
     let pos = Position::from_fen(&fen)
         .map_err(|e| BinpackError::InvalidPosition(format!("{e:?} for FEN: {fen}")))?;
@@ -356,26 +399,120 @@ pub fn record_to_entry(rec: &V6Record, ply: u16) -> Result<TrainingDataEntry, Bi
         MOVE_STRS[best_idx].to_string()
     };
 
-    check_legal_standard_chess(&uci, &fen)?;
+    // Legality check — also returns the shakmaty Chess position for TB probe.
+    let legality = check_legal_standard_chess(&uci, &fen)?;
+
+    // Syzygy probe — reuses the already-parsed shakmaty position.
+    let tb_result = prober.probe(&fen, &legality.shakmaty_pos);
 
     let mv = parse_uci_move(&uci, &pos)?;
 
-    Ok(TrainingDataEntry {
+    let entry = TrainingDataEntry {
         pos,
         mv,
         score:  best_q_to_score(rec),
         ply,
         result: result_q_to_result(rec.result_q),
-    })
+    };
+
+    Ok(ConvertedEntry { entry, tb_result })
+}
+
+// ── Buffered game entry ───────────────────────────────────────────────────────
+
+/// One position buffered for a game, ready to be patched and written.
+struct BufferedEntry {
+    entry:     TrainingDataEntry,
+    /// STM-relative TB result if the probe hit at this position.
+    tb_result: Option<i16>,
+}
+
+// ── Result propagation ────────────────────────────────────────────────────────
+
+/// Patch result fields of buffered entries using the first TB hit.
+///
+/// Strategy:
+/// 1. Find the first entry index where `tb_result` is `Some`.
+/// 2. From that index forward (to end): set result to the TB value,
+///    flipping sign for each ply step away from the hit.
+/// 3. If `backpropagate`: from that index backward (to start): same logic.
+///
+/// The sign convention is STM-relative throughout.  At the hit ply the
+/// TB result is correct for the STM at that ply.  One ply earlier the
+/// opponent is to move, so the result flips.  Two plies earlier it is
+/// the same side again, so it flips back.  In general:
+///
+///   result_at_ply_n = tb_result_at_hit * (-1)^(hit_ply - n)
+///
+/// Which in integer arithmetic is:
+///   if (hit_ply - n) is even  → same sign as tb_result
+///   if (hit_ply - n) is odd   → negated
+fn propagate_tb_result(entries: &mut Vec<BufferedEntry>, backpropagate: bool) {
+    // Find the first TB hit.
+    let hit_idx = match entries.iter().position(|e| e.tb_result.is_some()) {
+        Some(i) => i,
+        None    => return,  // No TB hit in this game — nothing to do.
+    };
+
+    let tb_result = entries[hit_idx].tb_result.unwrap();
+
+    // Propagate forward from the hit (inclusive) to end-of-game.
+    for (offset, e) in entries[hit_idx..].iter_mut().enumerate() {
+        // offset 0 → hit ply, sign unchanged.
+        // offset 1 → one ply after hit, opponent STM, sign flipped.
+        e.entry.result = if offset % 2 == 0 { tb_result } else { -tb_result };
+    }
+
+    // Propagate backward from the hit (exclusive) to start-of-game.
+    if backpropagate && hit_idx > 0 {
+        for (offset, e) in entries[..hit_idx].iter_mut().rev().enumerate() {
+            // offset 0 → one ply before hit, sign flipped.
+            // offset 1 → two plies before hit, sign unchanged.
+            e.entry.result = if offset % 2 == 0 { -tb_result } else { tb_result };
+        }
+    }
+}
+
+// ── WDL counters ──────────────────────────────────────────────────────────────
+
+/// Win / draw / loss counts for written entries.
+///
+/// Results are always STM-relative (+1 win, 0 draw, -1 loss).
+#[derive(Default, Clone, Copy)]
+pub struct WdlCounts {
+    pub wins:   usize,
+    pub draws:  usize,
+    pub losses: usize,
+}
+
+impl WdlCounts {
+    fn tally(&mut self, result: i16) {
+        match result {
+             1 => self.wins   += 1,
+             0 => self.draws  += 1,
+            -1 => self.losses += 1,
+            _  => {}
+        }
+    }
 }
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 
 /// Writes V6Records to a `.binpack` file, appending if the file already exists.
+///
+/// Records are buffered per game (one `.gz` file = one game).  Call
+/// `flush_game(backpropagate)` at the end of each game and `flush()` once
+/// at the very end to finalise the stream.
 pub struct BinpackWriter {
-    inner:   Option<CompressedTrainingDataEntryWriter<BufWriter<File>>>,
-    written: usize,
-    skipped: usize,
+    inner:             Option<CompressedTrainingDataEntryWriter<BufWriter<File>>>,
+    game_buf:          Vec<BufferedEntry>,
+    written:           usize,
+    skipped:           usize,
+    tb_hits:           usize,
+    /// WDL counts from the original lc0 result_q values (before any TB patch).
+    pub wdl_original:  WdlCounts,
+    /// WDL counts from the final result written to binpack (after TB patch).
+    pub wdl_corrected: WdlCounts,
 }
 
 impl BinpackWriter {
@@ -389,31 +526,96 @@ impl BinpackWriter {
         let inner = CompressedTrainingDataEntryWriter::new(BufWriter::new(file))
             .map_err(|e| BinpackError::Writer(e.to_string()))?;
 
-        Ok(Self { inner: Some(inner), written: 0, skipped: 0 })
+        Ok(Self {
+            inner:         Some(inner),
+            game_buf:      Vec::new(),
+            written:       0,
+            skipped:       0,
+            tb_hits:       0,
+            wdl_original:  WdlCounts::default(),
+            wdl_corrected: WdlCounts::default(),
+        })
     }
 
-    /// Write one record at the given game-relative `ply`.
+    /// Buffer one record at the given game-relative `ply`.
     ///
-    /// Returns `Ok(true)` on success, `Ok(false)` if the record was skipped
-    /// due to a recoverable conversion error (bad FEN, illegal move, FRC
-    /// position, etc.).  Fatal IO/writer errors are propagated.
-    pub fn write_record(&mut self, rec: &V6Record, ply: u16) -> Result<bool, BinpackError> {
-        match record_to_entry(rec, ply) {
-            Ok(entry) => {
-                self.inner
-                    .as_mut()
-                    .expect("write_record called after flush")
-                    .write_entry(&entry)
-                    .map_err(|e| BinpackError::Writer(e.to_string()))?;
-                self.written += 1;
-                Ok(true)
+    /// The Syzygy probe is skipped for this position if `prober` has no
+    /// tables loaded, the position has >7 pieces, or the position is not
+    /// in the tablebase.  Probing is also skipped once a TB hit has already
+    /// been recorded in the current game buffer — pass `tb_hit_found` as
+    /// `true` once the caller detects a hit to avoid further disk I/O.
+    ///
+    /// Returns:
+    /// - `Ok((true, hit))`  — entry buffered; `hit` is `true` if this record
+    ///                        produced the first TB hit in the current game.
+    /// - `Ok((false, _))`  — record skipped due to recoverable conversion error.
+    /// - `Err(_)`           — fatal IO / writer error.
+    pub fn buffer_record(
+        &mut self,
+        rec:           &V6Record,
+        ply:           u16,
+        prober:        &SyzygyProber,
+        tb_hit_found:  bool,
+    ) -> Result<(bool, bool), BinpackError> {
+        // Once we have a TB hit in this game we stop probing to avoid
+        // unnecessary disk I/O.  Achieve this by passing a disabled prober.
+        let effective_prober: &SyzygyProber;
+        let disabled = SyzygyProber::disabled();
+        if tb_hit_found {
+            effective_prober = &disabled;
+        } else {
+            effective_prober = prober;
+        }
+
+        match record_to_converted(rec, ply, effective_prober) {
+            Ok(converted) => {
+                let new_hit = converted.tb_result.is_some();
+                if new_hit {
+                    self.tb_hits += 1;
+                }
+                self.game_buf.push(BufferedEntry {
+                    entry:     converted.entry,
+                    tb_result: converted.tb_result,
+                });
+                Ok((true, new_hit))
             }
             Err(e @ BinpackError::Io(_)) | Err(e @ BinpackError::Writer(_)) => Err(e),
             Err(_) => {
                 self.skipped += 1;
-                Ok(false)
+                Ok((false, false))
             }
         }
+    }
+
+    /// Flush the current game buffer to the binpack stream.
+    ///
+    /// Applies Syzygy result propagation (forward always; backward if
+    /// `backpropagate` is `true`), then writes all buffered entries.
+    ///
+    /// Tallies `wdl_original` from the pre-propagation results and
+    /// `wdl_corrected` from the final written results.
+    ///
+    /// Call this once per game (i.e. once per `.gz` file).
+    pub fn flush_game(&mut self, backpropagate: bool) -> Result<(), BinpackError> {
+        // Snapshot original results before any TB patching.
+        for e in &self.game_buf {
+            self.wdl_original.tally(e.entry.result);
+        }
+
+        // Patch results using TB hits (if any).
+        propagate_tb_result(&mut self.game_buf, backpropagate);
+
+        let writer = self.inner.as_mut().expect("flush_game called after flush");
+        for buffered in self.game_buf.drain(..) {
+            // Tally corrected result (may be identical to original if no TB hit).
+            self.wdl_corrected.tally(buffered.entry.result);
+            writer
+                .write_entry(&buffered.entry)
+                .map_err(|e| BinpackError::Writer(e.to_string()))?;
+            self.written += 1;
+        }
+
+        Ok(())
     }
 
     /// Flush and finalise the binpack stream.  Safe to call multiple times.
@@ -423,8 +625,9 @@ impl BinpackWriter {
         }
     }
 
-    pub fn written(&self) -> usize { self.written }
-    pub fn skipped(&self) -> usize { self.skipped }
+    pub fn written(&self)  -> usize { self.written  }
+    pub fn skipped(&self)  -> usize { self.skipped  }
+    pub fn tb_hits(&self)  -> usize { self.tb_hits  }
 }
 
 impl Drop for BinpackWriter {

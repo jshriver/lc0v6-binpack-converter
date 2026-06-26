@@ -19,11 +19,13 @@ mod moves;
 mod printer;
 mod progress;
 mod record;
+mod syzygy;
 
 use record::{V6Record, RECORD_SIZE};
 use printer::{Verbosity, print_record};
 use binpack::BinpackWriter;
 use progress::Progress;
+use syzygy::SyzygyProber;
 use std::{
     collections::HashMap,
     env,
@@ -40,39 +42,60 @@ const PROGRESS_INTERVAL: usize = 1000;
 // ── Args ──────────────────────────────────────────────────────────────────────
 
 struct Args {
-    files:     Vec<PathBuf>,
-    verbosity: Option<Verbosity>,
-    limit:     Option<usize>,
-    skip:      usize,
-    summary:   bool,
-    output:    Option<PathBuf>,
+    files:         Vec<PathBuf>,
+    verbosity:     Option<Verbosity>,
+    limit:         Option<usize>,
+    skip:          usize,
+    summary:       bool,
+    output:        Option<PathBuf>,
+    syzygy_path:   Option<PathBuf>,
+    backpropagate: bool,
+    _input_dir:    Option<PathBuf>,
 }
 
 fn usage(prog: &str) -> ! {
     eprintln!(
-        "Usage: {prog} [OPTIONS] <file> [<file> ...]\n\
+        "Usage: {prog} [OPTIONS] [<file> ...]\n\
          \n\
          OPTIONS:\n\
-           -b, --brief            One-line summary per record\n\
-           -n, --normal           Key fields per record\n\
-           -f, --full             All fields including policy and planes\n\
-           -l, --limit N          Only process the first N records\n\
-           -s, --skip N           Skip the first N records\n\
-           --summary              Print aggregate statistics at the end\n\
-           -o, --output <file>    Export to .binpack file\n\
-           -h, --help             Show this help\n\
+           -b, --brief                One-line summary per record\n\
+           -n, --normal               Key fields per record\n\
+           -f, --full                 All fields including policy and planes\n\
+           -l, --limit N              Only process the first N records\n\
+           -s, --skip N               Skip the first N records\n\
+           --summary                  Print aggregate statistics at the end\n\
+           -o, --output <file>        Export to .binpack file\n\
+           -d, --input-dir <dir>      Process all .gz files in a directory.\n\
+                                      Avoids shell glob limits on Windows/Linux.\n\
+                                      Can be combined with explicit file args.\n\
+           --syzygy-path <paths>      Colon-separated (semicolon on Windows) list\n\
+                                      of Syzygy tablebase directories.\n\
+                                      Positions with ≤7 pieces are probed; the\n\
+                                      first hit overrides result_q and is\n\
+                                      propagated forward through the game.\n\
+           --backpropagate            Also propagate the first Syzygy hit\n\
+                                      backward to move 1 (requires --syzygy-path).\n\
+                                      Without this flag only forward propagation\n\
+                                      (hit ply → end of game) is applied.\n\
+           -h, --help                 Show this help\n\
          \n\
          Without -b/-n/-f, shows a live progress bar instead of per-record output.\n\
          Both raw binary and gzip-compressed (.gz) files are supported.\n\
          Non-classical (FRC/variant) records are always skipped.\n\
          \n\
          EXAMPLES:\n\
-           # Silent export with progress bar\n\
-           {prog} -o out.binpack data/*.gz\n\
-           # Inspect first 10 records\n\
+           # Process a whole directory (no glob needed)\n\
+           {prog} -d /data/training -o out.binpack\n\
+           # Windows - no more PowerShell glob workarounds\n\
+           {prog} -d C:\\training\\run1 -o out.binpack\n\
+           # Export with Syzygy result correction\n\
+           {prog} -d /data/training -o out.binpack --syzygy-path /tb/syzygy\n\
+           # Export with full back+forward propagation\n\
+           {prog} -d /data/training -o out.binpack --syzygy-path /tb/syzygy --backpropagate\n\
+           # Inspect first 10 records of a single file\n\
            {prog} --normal --limit 10 game.gz\n\
-           # Inspect while exporting\n\
-           {prog} --brief -o out.binpack game.gz"
+           # Mix directory and explicit files\n\
+           {prog} -d /data/training extra1.gz extra2.gz -o out.binpack"
     );
     process::exit(1);
 }
@@ -80,13 +103,16 @@ fn usage(prog: &str) -> ! {
 fn parse_args() -> Args {
     let raw: Vec<String> = env::args().collect();
     let prog = raw.first().map(String::as_str).unwrap_or("lc0_parser");
-    let mut files     = Vec::new();
-    let mut verbosity = None;
-    let mut limit     = None;
-    let mut skip      = 0usize;
-    let mut summary   = false;
-    let mut output    = None;
-    let mut i         = 1;
+    let mut files         = Vec::new();
+    let mut verbosity     = None;
+    let mut limit         = None;
+    let mut skip          = 0usize;
+    let mut summary       = false;
+    let mut output        = None;
+    let mut syzygy_path   = None;
+    let mut backpropagate = false;
+    let mut input_dir     = None;
+    let mut i             = 1;
 
     while i < raw.len() {
         match raw[i].as_str() {
@@ -95,6 +121,7 @@ fn parse_args() -> Args {
             "-n" | "--normal" => verbosity = Some(Verbosity::Normal),
             "-f" | "--full"   => verbosity = Some(Verbosity::Full),
             "--summary"       => summary = true,
+            "--backpropagate" => backpropagate = true,
             "-l" | "--limit"  => {
                 i += 1;
                 limit = Some(raw.get(i)
@@ -113,6 +140,18 @@ fn parse_args() -> Args {
                     eprintln!("--output needs a filename"); process::exit(1);
                 })));
             }
+            "--syzygy-path" => {
+                i += 1;
+                syzygy_path = Some(PathBuf::from(raw.get(i).unwrap_or_else(|| {
+                    eprintln!("--syzygy-path needs a directory"); process::exit(1);
+                })));
+            }
+            "-d" | "--input-dir" => {
+                i += 1;
+                input_dir = Some(PathBuf::from(raw.get(i).unwrap_or_else(|| {
+                    eprintln!("--input-dir needs a directory"); process::exit(1);
+                })));
+            }
             other if other.starts_with('-') => {
                 eprintln!("Unknown option: {other}");
                 usage(prog);
@@ -122,12 +161,45 @@ fn parse_args() -> Args {
         i += 1;
     }
 
+    // Expand --input-dir: collect all .gz files, sorted for determinism.
+    if let Some(ref dir) = input_dir {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                let mut dir_files: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext| ext.eq_ignore_ascii_case("gz"))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                dir_files.sort();
+                if dir_files.is_empty() {
+                    eprintln!("Warning: no .gz files found in {}", dir.display());
+                } else {
+                    eprintln!("📂 Found {} .gz files in {}", dir_files.len(), dir.display());
+                }
+                files.extend(dir_files);
+            }
+            Err(e) => {
+                eprintln!("❌ Cannot read --input-dir {}: {e}", dir.display());
+                process::exit(1);
+            }
+        }
+    }
+
     if files.is_empty() {
-        eprintln!("Error: no input files specified.");
+        eprintln!("Error: no input files specified. Use -d <dir> or pass files directly.");
         usage(prog);
     }
 
-    Args { files, verbosity, limit, skip, summary, output }
+    if backpropagate && syzygy_path.is_none() {
+        eprintln!("Warning: --backpropagate has no effect without --syzygy-path.");
+    }
+
+    Args { files, verbosity, limit, skip, summary, output, syzygy_path, backpropagate, _input_dir: input_dir }
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -207,18 +279,22 @@ fn open_reader(path: &PathBuf) -> io::Result<Box<dyn Read>> {
 // ── Per-file processing ───────────────────────────────────────────────────────
 
 fn process_file(
-    path:         &PathBuf,
-    args:         &Args,
-    global_index: &mut usize,
-    shown:        &mut usize,
-    stats:        &mut Stats,
-    writer:       &mut Option<BinpackWriter>,
-    prog:         &mut Option<Progress>,
+    path:          &PathBuf,
+    args:          &Args,
+    global_index:  &mut usize,
+    shown:         &mut usize,
+    stats:         &mut Stats,
+    writer:        &mut Option<BinpackWriter>,
+    prober:        &SyzygyProber,
+    prog:          &mut Option<Progress>,
 ) -> io::Result<()> {
     let mut reader           = open_reader(path)?;
     let mut buf              = vec![0u8; RECORD_SIZE];
     let mut file_skipped_err = 0usize;
     let mut ply: u16         = 0;
+    // Track whether we have already found a TB hit in this game so we can
+    // skip further probes (which cost disk I/O) for the rest of the file.
+    let mut tb_hit_found     = false;
 
     let filename = path.file_name()
         .and_then(|n| n.to_str())
@@ -286,8 +362,13 @@ fn process_file(
         }
 
         if let Some(w) = writer.as_mut() {
-            match w.write_record(&rec, rec_ply) {
-                Ok(_)  => {}
+            match w.buffer_record(&rec, rec_ply, prober, tb_hit_found) {
+                Ok((_, new_hit)) => {
+                    // Stop probing for the rest of this game once we have a hit.
+                    if new_hit {
+                        tb_hit_found = true;
+                    }
+                }
                 Err(e) => {
                     if args.verbosity.is_some() {
                         eprintln!("  ⚠️  Binpack error at #{rec_idx}: {e}");
@@ -306,6 +387,13 @@ fn process_file(
                     .unwrap_or((0, 0));
                 p.update(*shown, written, stats.skipped_frc, skipped_err + file_skipped_err);
             }
+        }
+    }
+
+    // End of game (file) — flush the game buffer with TB propagation.
+    if let Some(w) = writer.as_mut() {
+        if let Err(e) = w.flush_game(args.backpropagate) {
+            eprintln!("  ⚠️  Error flushing game for {filename}: {e}");
         }
     }
 
@@ -331,6 +419,28 @@ fn main() {
     let mut shown        = 0usize;
     let mut stats        = Stats::default();
 
+    // ── Syzygy prober ─────────────────────────────────────────────────────────
+    let prober = if let Some(ref sz_path) = args.syzygy_path {
+        match SyzygyProber::load(sz_path) {
+            Ok(p) => {
+                eprintln!("♟  Syzygy: tables loaded from {}", sz_path.display());
+                if args.backpropagate {
+                    eprintln!("♟  Syzygy: backward propagation enabled");
+                } else {
+                    eprintln!("♟  Syzygy: forward propagation only (use --backpropagate for full game)");
+                }
+                p
+            }
+            Err(e) => {
+                eprintln!("❌ {e}");
+                process::exit(1);
+            }
+        }
+    } else {
+        SyzygyProber::disabled()
+    };
+
+    // ── Binpack writer ────────────────────────────────────────────────────────
     let mut writer: Option<BinpackWriter> = if let Some(ref out_path) = args.output {
         match BinpackWriter::create(out_path) {
             Ok(w)  => {
@@ -352,7 +462,7 @@ fn main() {
     for path in &args.files {
         if let Err(e) = process_file(
             path, &args, &mut global_index, &mut shown, &mut stats,
-            &mut writer, &mut prog,
+            &mut writer, &prober, &mut prog,
         ) {
             eprintln!("❌ Error reading {}: {e}", path.display());
         }
@@ -360,10 +470,24 @@ fn main() {
 
     if let Some(w) = writer.as_mut() {
         w.flush();
+        let tb_hits   = w.tb_hits();
+        let wdl_orig  = w.wdl_original;
+        let wdl_corr  = w.wdl_corrected;
         if let Some(p) = prog.as_ref() {
             p.finish(w.written(), stats.skipped_frc, w.skipped());
         } else {
             eprintln!("💾 Binpack: {} written, {} skipped", w.written(), w.skipped());
+        }
+        eprintln!(
+            "📊 Original  WDL  — wins: {:>8}  draws: {:>8}  losses: {:>8}",
+            wdl_orig.wins, wdl_orig.draws, wdl_orig.losses
+        );
+        if prober.is_loaded() {
+            eprintln!("♟  Syzygy: {} TB hits applied", tb_hits);
+            eprintln!(
+                "📊 Corrected WDL  — wins: {:>8}  draws: {:>8}  losses: {:>8}",
+                wdl_corr.wins, wdl_corr.draws, wdl_corr.losses
+            );
         }
     } else if let Some(p) = prog.as_ref() {
         p.finish(0, stats.skipped_frc, 0);
