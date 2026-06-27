@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import itertools
 import re
 import shlex
 import shutil
@@ -19,10 +18,9 @@ from bs4 import BeautifulSoup
 # Configuration
 ###############################################################################
 
-BASE_URL      = "https://data.lczero.org/files/training_data/test91/"
-PARSER_BIN    = Path("./target/release/lc0v6-binpack-converter")
-BATCH_SIZE    = 1000
-TIMESTAMP_RE  = re.compile(r"(\d{8}-\d{4})")
+BASE_URL       = "https://data.lczero.org/files/training_data/test91/"
+PARSER_BIN     = Path("./target/release/lc0v6-binpack-converter")
+TIMESTAMP_RE   = re.compile(r"(\d{8}-\d{4})")
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; lc0-fetcher/1.0)"}
@@ -89,15 +87,6 @@ def run_with_spinner(cmd: list[str], label: str) -> int:
     return ret
 
 
-def chunked(items: list, size: int):
-    it = iter(items)
-    while True:
-        chunk = list(itertools.islice(it, size))
-        if not chunk:
-            return
-        yield chunk
-
-
 def timestamp_of(filename: str) -> str | None:
     m = TIMESTAMP_RE.search(filename)
     return m.group(1) if m else None
@@ -124,14 +113,29 @@ parser = argparse.ArgumentParser(
           Process up to a point:
             %(prog)s \\
                 --to 20251107-0917
+
+          With Syzygy tablebases:
+            %(prog)s \\
+                --from 20251106-1117 \\
+                --syzygy-path /path/to/syzygy
+
+          With backward propagation limit:
+            %(prog)s \\
+                --from 20251106-1117 \\
+                --syzygy-path /path/to/syzygy \\
+                --backpropagate-limit 10
     """),
 )
 parser.add_argument("--from", dest="from_ts", metavar="TIMESTAMP",
                     help="Start timestamp, e.g. 20251106-1117 (inclusive)")
 parser.add_argument("--to", dest="to_ts", metavar="TIMESTAMP",
                     help="End timestamp, e.g. 20251107-0917 (inclusive)")
-parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, metavar="N",
-                    help="Number of .gz files per parser invocation (default: %(default)s)")
+parser.add_argument("--syzygy-path", metavar="PATHS",
+                    help="Colon-separated Syzygy tablebase directories (passed through to parser)")
+parser.add_argument("--backpropagate", action="store_true",
+                    help="Propagate first Syzygy hit backward to move 1 (requires --syzygy-path)")
+parser.add_argument("--backpropagate-limit", type=int, metavar="N",
+                    help="Like --backpropagate but only patches N plies before the hit (implies --backpropagate)")
 args = parser.parse_args()
 
 if not args.from_ts and not args.to_ts:
@@ -145,6 +149,28 @@ if not args.from_ts and not args.to_ts:
 if not PARSER_BIN.exists():
     print(f"❌ Parser binary not found: {PARSER_BIN}")
     sys.exit(1)
+
+if args.backpropagate and not args.syzygy_path:
+    print("❌ --backpropagate requires --syzygy-path")
+    sys.exit(1)
+
+if args.backpropagate_limit and not args.syzygy_path:
+    print("❌ --backpropagate-limit requires --syzygy-path")
+    sys.exit(1)
+
+###############################################################################
+# Build reusable parser flags
+###############################################################################
+
+def build_parser_flags() -> list[str]:
+    flags = ["--summary"]
+    if args.syzygy_path:
+        flags += ["--syzygy-path", args.syzygy_path]
+    if args.backpropagate_limit is not None:
+        flags += ["--backpropagate-limit", str(args.backpropagate_limit)]
+    elif args.backpropagate:
+        flags.append("--backpropagate")
+    return flags
 
 ###############################################################################
 # Fetch tarball list
@@ -197,7 +223,12 @@ if args.from_ts:
     print(f"📍 From              : {args.from_ts}")
 if args.to_ts:
     print(f"🏁 To                : {args.to_ts}")
-print(f"🧮 Batch size        : {args.batch_size}")
+if args.syzygy_path:
+    print(f"♟️  Syzygy path       : {args.syzygy_path}")
+if args.backpropagate_limit is not None:
+    print(f"⏪ Backprop limit    : {args.backpropagate_limit}")
+elif args.backpropagate:
+    print(f"⏪ Backpropagate     : full")
 
 if not tarballs:
     print("\n❌ Selected range contains no tarballs.")
@@ -206,6 +237,8 @@ if not tarballs:
 ###############################################################################
 # Main loop
 ###############################################################################
+
+parser_flags = build_parser_flags()
 
 for tarball in tarballs:
 
@@ -242,32 +275,24 @@ for tarball in tarballs:
     else:
         print("📂 Already extracted.")
 
-    # Gather .gz files
-    gz_files = sorted(str(p) for p in extract_path.glob("*.gz"))
+    # Verify the directory has .gz files before invoking the parser
+    gz_files = list(extract_path.glob("*.gz"))
     if not gz_files:
         print("⚠️  No .gz files found, nothing to parse.")
         shutil.rmtree(extract_path, ignore_errors=True)
         continue
 
-    print(f"🧠 Parsing {len(gz_files)} files in batches of {args.batch_size}...")
+    print(f"🧠 Parsing {len(gz_files)} files via -d flag...")
 
-    # Run parser in batches (appends to binpack_path each call)
-    batches = list(chunked(gz_files, args.batch_size))
-    for i, batch in enumerate(batches, start=1):
-        if stop_requested:
-            print("\n🛑 Stopping due to interrupt.")
-            sys.exit(130)
-
-        print(f"   ▶️  Batch {i}/{len(batches)} ({len(batch)} files)")
-        ret = run([
-            str(PARSER_BIN),
-            "--summary",
-            "-o", str(binpack_path),
-            *batch,
-        ])
-        if ret != 0:
-            print(f"❌ Parser failed (exit {ret})")
-            sys.exit(ret)
+    ret = run([
+        str(PARSER_BIN),
+        *parser_flags,
+        "-o", str(binpack_path),
+        "-d", str(extract_path),
+    ])
+    if ret != 0:
+        print(f"❌ Parser failed (exit {ret})")
+        sys.exit(ret)
 
     # Cleanup
     print("🧹 Cleaning up...")
